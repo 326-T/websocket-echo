@@ -1,5 +1,11 @@
+import base64
+import json
+import logging
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -12,13 +18,27 @@ app.add_middleware(
 
 
 @app.websocket("/ws")
-async def websocket_echo(websocket: WebSocket):
+async def websocket_echo(websocket: WebSocket) -> None:
     await websocket.accept()
-    print("WebSocket connected")
+    logger.info("WebSocket connected")
     try:
         while True:
-            data = await websocket.receive_bytes()
-            print(f"Echo {len(data)} bytes")
-            await websocket.send_bytes(data)
+            message = json.loads(await websocket.receive_text())
+            msg_type = message.get("type", "")
+
+            if msg_type == "input_audio_buffer.append":
+                audio_b64 = message["audio"]
+                logger.info(
+                    "Echo audio chunk, size=%d bytes",
+                    len(base64.b64decode(audio_b64)),
+                )
+                await websocket.send_json(
+                    {
+                        "type": "response.audio.delta",
+                        "delta": audio_b64,
+                    }
+                )
+            else:
+                logger.warning("Unknown message type: %s", msg_type)
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
+        logger.info("WebSocket disconnected")
