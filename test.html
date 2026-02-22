@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head><title>Audio Test</title></head>
+<body style="font-family:sans-serif; text-align:center; padding:40px;">
+<h2>Browser Audio Test</h2>
+<p id="log">Click a button to test</p>
+
+<button onclick="testTone()">1. Play generated tone (AudioContext)</button><br><br>
+<button onclick="testRecord()">2. Record 3sec → play back locally</button><br><br>
+<button onclick="testEcho()">3. Record 3sec → WebSocket echo → play</button>
+
+<script>
+const log = (msg) => { document.getElementById('log').textContent = msg; console.log(msg); };
+
+// Test 1: Generate and play a tone using AudioContext
+function testTone() {
+  log('Playing 440Hz tone...');
+  const ctx = new AudioContext();
+  const osc = ctx.createOscillator();
+  osc.frequency.value = 440;
+  osc.connect(ctx.destination);
+  osc.start();
+  osc.stop(ctx.currentTime + 1);
+  osc.onended = () => { ctx.close(); log('Tone done'); };
+}
+
+// WAV encoder
+function encodeWav(samples, sampleRate) {
+  const n = samples.length, db = n * 2;
+  const buf = new ArrayBuffer(44 + db);
+  const v = new DataView(buf);
+  const w = (o,s) => { for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4,36+db,true); w(8,'WAVE'); w(12,'fmt ');
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sampleRate,true); v.setUint32(28,sampleRate*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true);
+  w(36,'data'); v.setUint32(40,db,true);
+  for(let i=0;i<n;i++){
+    const s=Math.max(-1,Math.min(1,samples[i]));
+    v.setInt16(44+i*2, s*(s<0?0x8000:0x7FFF), true);
+  }
+  return buf;
+}
+
+// Record PCM using ScriptProcessor
+function captureAudio(seconds) {
+  return new Promise(async (resolve) => {
+    const ctx = new AudioContext();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+
+    proc.onaudioprocess = (e) => {
+      chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      e.outputBuffer.getChannelData(0).fill(0);
+    };
+    src.connect(proc);
+    proc.connect(ctx.destination);
+
+    log('Recording for ' + seconds + 's...');
+    setTimeout(() => {
+      proc.disconnect(); src.disconnect();
+      stream.getTracks().forEach(t => t.stop());
+      ctx.close();
+      const len = chunks.reduce((s,c) => s+c.length, 0);
+      const merged = new Float32Array(len);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.length; }
+      const wav = encodeWav(merged, ctx.sampleRate);
+      log('Recorded ' + wav.byteLength + ' bytes WAV');
+      resolve(wav);
+    }, seconds * 1000);
+  });
+}
+
+// Test 2: Record → play locally
+async function testRecord() {
+  const wav = await captureAudio(3);
+  log('Decoding and playing locally...');
+  const ctx = new AudioContext();
+  const buf = await ctx.decodeAudioData(wav.slice(0));
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.onended = () => { ctx.close(); log('Local playback done'); };
+  src.start();
+}
+
+// Test 3: Record → WebSocket echo → play
+async function testEcho() {
+  const wav = await captureAudio(3);
+  log('Sending ' + wav.byteLength + ' bytes to WebSocket...');
+  const playCtx = new AudioContext();
+  const ws = new WebSocket('ws://localhost:8000/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => ws.send(wav);
+  ws.onmessage = async (ev) => {
+    ws.close();
+    log('Received echo ' + ev.data.byteLength + ' bytes, playing...');
+    const buf = await playCtx.decodeAudioData(ev.data.slice(0));
+    const src = playCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(playCtx.destination);
+    src.onended = () => { playCtx.close(); log('Echo playback done'); };
+    src.start();
+  };
+}
+</script>
+</body>
+</html>
