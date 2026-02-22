@@ -10,26 +10,23 @@ function App() {
       <header className="App-header">
         <h1>WebSocket Audio Echo</h1>
         <p>
-          {status === "recording"
-            ? "Recording..."
-            : status === "sending"
-              ? "Sending..."
-              : status === "playing"
-                ? "Playing back..."
-                : "Ready"}
+          {status === "listening"
+            ? "Listening..."
+            : status === "speaking"
+              ? "Speaking..."
+              : "Ready"}
         </p>
-        {status === "ready" && (
+        {status === "idle" ? (
           <button className="btn" onClick={start}>
             Start
           </button>
-        )}
-        {status === "recording" && (
+        ) : (
           <button className="btn btn-stop" onClick={stop}>
             Stop
           </button>
         )}
         <p className="hint">
-          Start → speak → Stop で、おうむ返しが再生されます
+          Start → 喋ると無音検知後に自動でおうむ返しされます
         </p>
       </header>
     </div>

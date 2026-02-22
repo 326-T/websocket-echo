@@ -1,10 +1,10 @@
 import { useRef, useState, useCallback } from "react";
 
-export type EchoStatus = "ready" | "recording" | "sending" | "playing";
+export type EchoStatus = "idle" | "listening" | "speaking";
 
 const TARGET_SAMPLE_RATE = 24000;
 
-/** Float32 PCM を 16-bit signed PCM (little-endian) の ArrayBuffer に変換 */
+/** Float32 PCM → 16-bit signed PCM (little-endian) */
 function float32ToPcm16(samples: Float32Array): ArrayBuffer {
   const buf = new ArrayBuffer(samples.length * 2);
   const view = new DataView(buf);
@@ -15,7 +15,7 @@ function float32ToPcm16(samples: Float32Array): ArrayBuffer {
   return buf;
 }
 
-/** 16-bit signed PCM (little-endian) の ArrayBuffer を Float32 に変換 */
+/** 16-bit signed PCM (little-endian) → Float32 */
 function pcm16ToFloat32(buf: ArrayBuffer): Float32Array {
   const view = new DataView(buf);
   const out = new Float32Array(buf.byteLength / 2);
@@ -45,7 +45,7 @@ function resample(
   return out;
 }
 
-/** ArrayBuffer → Base64 文字列 */
+/** ArrayBuffer → Base64 */
 function arrayBufferToBase64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
   let binary = "";
@@ -55,7 +55,7 @@ function arrayBufferToBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
-/** Base64 文字列 → ArrayBuffer */
+/** Base64 → ArrayBuffer */
 function base64ToArrayBuffer(b64: string): ArrayBuffer {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
@@ -66,111 +66,131 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
 }
 
 export function useAudioEcho(wsUrl: string) {
-  const [status, setStatus] = useState<EchoStatus>("ready");
+  const [status, setStatus] = useState<EchoStatus>("idle");
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const playCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const pcmRef = useRef<Float32Array[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
   const srRef = useRef(48000);
+  const nextPlayTimeRef = useRef(0);
+
+  const playPcm16 = useCallback((b64: string) => {
+    let playCtx = playCtxRef.current;
+    if (!playCtx || playCtx.state === "closed") {
+      playCtx = new AudioContext();
+      playCtxRef.current = playCtx;
+      nextPlayTimeRef.current = 0;
+    }
+
+    const pcm16 = base64ToArrayBuffer(b64);
+    const float32 = pcm16ToFloat32(pcm16);
+
+    const audioBuffer = playCtx.createBuffer(1, float32.length, TARGET_SAMPLE_RATE);
+    audioBuffer.copyToChannel(float32, 0);
+
+    const src = playCtx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(playCtx.destination);
+
+    // チャンクを隙間なくスケジューリング
+    const now = playCtx.currentTime;
+    const startAt = Math.max(now, nextPlayTimeRef.current);
+    nextPlayTimeRef.current = startAt + audioBuffer.duration;
+
+    setStatus("speaking");
+    src.onended = () => {
+      // 次の再生が予約されていなければ listening に戻す
+      if (playCtx && playCtx.currentTime >= nextPlayTimeRef.current - 0.01) {
+        setStatus("listening");
+      }
+    };
+    src.start(startAt);
+  }, []);
 
   const start = useCallback(async () => {
-    pcmRef.current = [];
+    // 再生用 AudioContext をユーザー操作コンテキストで作成
+    const playCtx = new AudioContext();
+    playCtxRef.current = playCtx;
+    nextPlayTimeRef.current = 0;
 
-    const ctx = new AudioContext();
-    audioCtxRef.current = ctx;
-    srRef.current = ctx.sampleRate;
+    const captureCtx = new AudioContext();
+    audioCtxRef.current = captureCtx;
+    srRef.current = captureCtx.sampleRate;
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     streamRef.current = stream;
 
-    const src = ctx.createMediaStreamSource(stream);
-    sourceRef.current = src;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
 
-    const proc = ctx.createScriptProcessor(4096, 1, 1);
-    processorRef.current = proc;
-
-    proc.onaudioprocess = (e) => {
-      pcmRef.current.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-      e.outputBuffer.getChannelData(0).fill(0);
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "response.audio.delta") {
+          playPcm16(msg.delta);
+        }
+      } catch {
+        // ignore parse errors
+      }
     };
 
-    src.connect(proc);
-    proc.connect(ctx.destination);
-    setStatus("recording");
-  }, []);
+    ws.onopen = () => {
+      const micSrc = captureCtx.createMediaStreamSource(stream);
+      sourceRef.current = micSrc;
+
+      const proc = captureCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = proc;
+
+      proc.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const raw = new Float32Array(e.inputBuffer.getChannelData(0));
+        const resampled = resample(raw, srRef.current, TARGET_SAMPLE_RATE);
+        const pcm16 = float32ToPcm16(resampled);
+        const b64 = arrayBufferToBase64(pcm16);
+
+        ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+
+        e.outputBuffer.getChannelData(0).fill(0);
+      };
+
+      micSrc.connect(proc);
+      proc.connect(captureCtx.destination);
+      setStatus("listening");
+    };
+  }, [wsUrl, playPcm16]);
 
   const stop = useCallback(() => {
     processorRef.current?.disconnect();
     sourceRef.current?.disconnect();
     streamRef.current?.getTracks().forEach((t) => t.stop());
+    wsRef.current?.close();
     audioCtxRef.current?.close();
 
-    // マージ
-    const chunks = pcmRef.current;
-    const len = chunks.reduce((s, c) => s + c.length, 0);
-    const merged = new Float32Array(len);
-    let off = 0;
-    for (const c of chunks) {
-      merged.set(c, off);
-      off += c.length;
+    // 再生中の音を待ってから閉じる
+    const playCtx = playCtxRef.current;
+    if (playCtx && playCtx.state !== "closed") {
+      const remaining = nextPlayTimeRef.current - playCtx.currentTime;
+      if (remaining > 0) {
+        setTimeout(() => {
+          playCtx.close();
+        }, remaining * 1000 + 100);
+      } else {
+        playCtx.close();
+      }
     }
 
-    // 24kHz にリサンプル → PCM16 → Base64
-    const resampled = resample(merged, srRef.current, TARGET_SAMPLE_RATE);
-    const pcm16 = float32ToPcm16(resampled);
-    const b64 = arrayBufferToBase64(pcm16);
+    processorRef.current = null;
+    sourceRef.current = null;
+    streamRef.current = null;
+    wsRef.current = null;
+    audioCtxRef.current = null;
+    playCtxRef.current = null;
 
-    // 再生用 AudioContext をユーザー操作コンテキストで作成
-    const playCtx = new AudioContext();
-
-    setStatus("sending");
-
-    const ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: b64,
-        }),
-      );
-    };
-
-    ws.onmessage = (ev) => {
-      ws.close();
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type !== "response.audio.delta") return;
-
-        // Base64 → PCM16 → Float32
-        const echoPcm16 = base64ToArrayBuffer(msg.delta);
-        const echoFloat32 = pcm16ToFloat32(echoPcm16);
-
-        // AudioBuffer を作って再生
-        const audioBuffer = playCtx.createBuffer(
-          1,
-          echoFloat32.length,
-          TARGET_SAMPLE_RATE,
-        );
-        audioBuffer.copyToChannel(echoFloat32, 0);
-
-        const src = playCtx.createBufferSource();
-        src.buffer = audioBuffer;
-        src.connect(playCtx.destination);
-        setStatus("playing");
-        src.onended = () => {
-          playCtx.close();
-          setStatus("ready");
-        };
-        src.start();
-      } catch (e) {
-        console.error("Playback failed:", e);
-        playCtx.close();
-        setStatus("ready");
-      }
-    };
-  }, [wsUrl]);
+    setStatus("idle");
+  }, []);
 
   return { status, start, stop } as const;
 }
