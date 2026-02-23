@@ -4,8 +4,6 @@
 
 ## プロトコル
 
-dialog_master 互換の JSON + Base64 形式。
-
 ```
 Client → Server:  { "type": "input_audio_buffer.append", "audio": "<base64 PCM16 24kHz>" }
 Server → Client:  { "type": "response.audio.delta", "delta": "<base64 PCM16 24kHz>" }
